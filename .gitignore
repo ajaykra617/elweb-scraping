@@ -1,0 +1,15 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+
+# Docker
+storage/results/
+*.log
+
+# Environment & system
+.env
+.DS_Store

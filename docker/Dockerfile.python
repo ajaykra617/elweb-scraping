@@ -1,0 +1,7 @@
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y curl iputils-ping && rm -rf /var/lib/apt/lists/*
+COPY src/workers/python/python_worker.py /app/python_worker.py
+RUN pip install --no-cache-dir redis requests
+COPY . .
+CMD ["python", "python_worker.py"]

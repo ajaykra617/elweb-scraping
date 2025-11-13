@@ -1,0 +1,35 @@
+version: '3.9'
+services:
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+
+  worker-node:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    env_file: .env
+    depends_on:
+      - redis
+
+  worker-python:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    env_file: .env
+    depends_on:
+      - redis
+    volumes:
+      - ./storage/results:/data/results
