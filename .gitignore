@@ -8,8 +8,10 @@ __pycache__/
 
 # Docker
 storage/results/
+storage/db-data/
 *.log
 
 # Environment & system
 .env
 .DS_Store
+pgadmin/

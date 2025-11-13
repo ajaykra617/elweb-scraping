@@ -1,0 +1,63 @@
+ELWEB-SCRAPING DB ADDON - INSTRUCTIONS
+=====================================
+
+Files added:
+- docker-compose.addon.yml
+- .env.append
+- src/api/db.js
+- src/api/server.db-init.js
+- src/api/models/User.js
+- src/api/models/Job.js
+- src/api/routes/auth.db.js
+- src/api/routes/jobs.db.js
+
+Step 0 - location
+This package was prepared for placement inside:
+  /home/welldata/elweb-scraping/
+
+If your project is elsewhere, move files accordingly.
+
+Step 1 - extract
+Copy or extract all files into your project root (next to your existing docker-compose.yml).
+
+Step 2 - merge env
+Append the .env.append into your existing .env:
+  cd /home/welldata/elweb-scraping
+  cat .env.append >> .env
+
+Verify .env contains:
+  DATABASE_URL=postgresql://eluser:elpass@db:5432/elweb
+  PGADMIN_EMAIL=admin@elweb.local
+  PGADMIN_PASSWORD=admin123
+
+Step 3 - mount routes in server.js
+Open your existing src/api/server.js (or equivalent entry) and add:
+
+  import { initDB } from './server.db-init.js';
+  import authRoutes from './routes/auth.db.js';
+  import jobRoutes from './routes/jobs.db.js';
+
+After app creation (const app = express();), call:
+  initDB();
+
+After middleware, mount routes:
+  app.use('/auth', authRoutes);
+  app.use('/jobs', jobRoutes);
+
+Step 4 - run
+Start combined compose:
+  docker compose -f docker-compose.yml -f docker-compose.addon.yml up --build
+
+Step 5 - test
+- Signup:
+  curl -X POST http://localhost:8000/auth/signup -H "Content-Type: application/json" -d '{"email":"test@demo.com","password":"123456"}'
+- Login:
+  curl -X POST http://localhost:8000/auth/login -H "Content-Type: application/json" -d '{"email":"test@demo.com","password":"123456"}'
+- Start job:
+  curl -X POST http://localhost:8000/jobs/start -H "Content-Type: application/json" -d '{"userId":1,"inputFile":"products.csv","totalItems":10}'
+- List jobs:
+  curl http://localhost:8000/jobs/user/1
+
+Notes:
+- This starter uses Sequelize with sync({ alter: true }) to auto-create tables. For production use migrations.
+- Auth returns user id only. Add JWT or session handling later.
