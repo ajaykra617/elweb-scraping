@@ -1,0 +1,18 @@
+services:
+  tests:
+    image: python:3.11-slim
+    container_name: elweb-tests
+    depends_on:
+      - api
+      - worker-node
+      - worker-python
+      - db
+      - redis
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: >
+      sh -c "
+        pip install --no-cache-dir pytest requests &&
+        pytest -q
+      "
