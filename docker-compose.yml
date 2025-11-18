@@ -15,6 +15,10 @@ services:
       - "8000:8000"
     depends_on:
       - redis
+    volumes:
+      - ./storage/results:/data/results
+      - ./storage/scripts:/data/scripts
+
 
   worker-node:
     build:
@@ -23,6 +27,9 @@ services:
     env_file: .env
     depends_on:
       - redis
+    volumes:
+    - ./storage/results:/data/results
+    - ./storage/scripts:/data/scripts
 
   worker-python:
     build:
@@ -33,3 +40,21 @@ services:
       - redis
     volumes:
       - ./storage/results:/data/results
+      - ./storage/scripts:/data/scripts
+  worker-batch-row:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node   # <-- this is the correct Dockerfile
+    command: node src/workers/node/batch_row_worker.js
+    env_file: .env
+    volumes:
+      - ./src:/app/src
+      - ./storage/results:/data/results
+      - ./storage/uploads:/data/uploads
+      - ./storage/scripts:/data/scripts
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - WORKER_CONCURRENCY=10
+      - WORKER_MAX_CHILDREN=1000

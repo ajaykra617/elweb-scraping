@@ -1,13 +1,12 @@
-import dotenv from 'dotenv';
+// src/config/env.js
+import dotenv from "dotenv";
 dotenv.config();
 
-export const REDIS_URL =
-  process.env.REDIS_URL ||
-  `redis://${process.env.REDIS_HOST || 'redis'}:${process.env.REDIS_PORT || 6379}`;
-
-export const PORT = parseInt(process.env.PORT || '8000', 10);
-export const RESULTS_PATH = process.env.RESULTS_PATH || './storage/results';
-export const API_CONCURRENCY = parseInt(process.env.API_CONCURRENCY || '3', 10);
+export const REDIS_URL = process.env.REDIS_URL || "redis://redis:6379";
+export const PORT = Number(process.env.PORT || 8000);
+export const QUEUE_PREFIX = process.env.QUEUE_PREFIX || "bull"; // default fallback
+export const API_CONCURRENCY = Number(process.env.API_CONCURRENCY || 5);
+export const RESULTS_PATH = process.env.RESULTS_PATH || "/data/results";
 
 console.log('✅ Environment loaded:', {
   REDIS_URL,
@@ -15,3 +14,4 @@ console.log('✅ Environment loaded:', {
   API_CONCURRENCY,
   RESULTS_PATH,
 });
+

@@ -1,0 +1,731 @@
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: node_modules
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+docker/
+  Dockerfile.api
+  Dockerfile.node
+  Dockerfile.python
+src/
+  api/
+    models/
+      Job.js
+      User.js
+    routes/
+      auth.db.js
+      jobs.db.js
+    db.js
+    server.db-init.js
+    server.js
+  config/
+    env.js
+  queue/
+    queue.js
+  tests/
+    api/
+      health.test.js
+      queue.test.js
+    python/
+      test_stub_worker.py
+    workers/
+      node-worker.test.js
+      python-worker.test.js
+    test_node.js
+    test_python.py
+  workers/
+    node/
+      worker.js
+    python/
+      python_worker.py
+.dockerignore
+.env.append
+.gitignore
+docker-compose.addon.yml
+docker-compose.test.yml
+docker-compose.yml
+instructions.txt
+jest.config.js
+package.json
+pytest.ini
+README.md
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="docker/Dockerfile.api">
+FROM node:20-alpine
+WORKDIR /app
+# debug tools
+RUN apk add --no-cache curl iputils
+COPY package*.json ./
+RUN npm install --omit=dev
+COPY . .
+EXPOSE 8000
+CMD ["node", "src/api/server.js"]
+</file>
+
+<file path="docker/Dockerfile.node">
+FROM node:20-alpine
+RUN apk add --no-cache curl iputils python3 py3-pip
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --production
+COPY . .
+CMD ["node", "src/workers/node/worker.js"]
+</file>
+
+<file path="docker/Dockerfile.python">
+FROM python:3.11-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y curl iputils-ping && rm -rf /var/lib/apt/lists/*
+COPY src/workers/python/python_worker.py /app/python_worker.py
+RUN pip install --no-cache-dir redis requests
+COPY . .
+CMD ["python", "python_worker.py"]
+</file>
+
+<file path="src/api/models/Job.js">
+import { DataTypes } from 'sequelize';
+import { sequelize } from '../db.js';
+import User from './User.js';
+
+const Job = sequelize.define('Job', {
+  inputFile: { type: DataTypes.STRING, allowNull: true },
+  totalItems: { type: DataTypes.INTEGER, allowNull: true },
+  status: { type: DataTypes.STRING, defaultValue: 'queued' },
+  resultPath: { type: DataTypes.STRING, allowNull: true },
+  resultFileName: { type: DataTypes.STRING, allowNull: true },
+  successCount: { type: DataTypes.INTEGER, allowNull: true },
+  failedCount: { type: DataTypes.INTEGER, allowNull: true },
+  startedAt: { type: DataTypes.DATE, allowNull: true },
+  finishedAt: { type: DataTypes.DATE, allowNull: true }
+});
+
+Job.belongsTo(User);
+User.hasMany(Job);
+
+export default Job;
+</file>
+
+<file path="src/api/models/User.js">
+import { DataTypes } from 'sequelize';
+import { sequelize } from '../db.js';
+
+const User = sequelize.define('User', {
+  email: { type: DataTypes.STRING, allowNull: false, unique: true },
+  password: { type: DataTypes.STRING, allowNull: false },
+});
+
+export default User;
+</file>
+
+<file path="src/api/routes/auth.db.js">
+import express from 'express';
+import bcrypt from 'bcrypt';
+import User from '../models/User.js';
+
+const router = express.Router();
+
+router.post('/signup', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    const hashed = await bcrypt.hash(password, 10);
+    const user = await User.create({ email, password: hashed });
+    res.json({ message: 'User created', id: user.id });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.post('/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+    const user = await User.findOne({ where: { email } });
+    if (!user || !(await bcrypt.compare(password, user.password))) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    // NOTE: this returns user id only. Add JWT/session as needed later.
+    res.json({ message: 'Login success', id: user.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+export default router;
+</file>
+
+<file path="src/api/routes/jobs.db.js">
+import express from 'express';
+import Job from '../models/Job.js';
+
+const router = express.Router();
+
+// Start a new job
+router.post('/start', async (req, res) => {
+  try {
+    const { userId, inputFile, totalItems } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const job = await Job.create({ userId, inputFile, totalItems, status: 'queued', startedAt: new Date() });
+    res.json({ status: 'queued', jobId: job.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update job
+router.post('/:id/update', async (req, res) => {
+  try {
+    const { status, successCount, failedCount, resultPath, resultFileName } = req.body;
+    const job = await Job.findByPk(req.params.id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    await job.update({
+      status,
+      successCount,
+      failedCount,
+      resultPath,
+      resultFileName,
+      finishedAt: status === 'completed' ? new Date() : job.finishedAt
+    });
+    res.json({ success: true, job });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/:id', async (req, res) => {
+  const job = await Job.findByPk(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json(job);
+});
+
+router.get('/user/:userId', async (req, res) => {
+  const jobs = await Job.findAll({ where: { userId: req.params.userId }, order: [['id','DESC']] });
+  res.json(jobs);
+});
+
+export default router;
+</file>
+
+<file path="src/api/db.js">
+import { Sequelize } from 'sequelize';
+import dotenv from 'dotenv';
+dotenv.config();
+
+export const sequelize = new Sequelize(process.env.DATABASE_URL, {
+  dialect: 'postgres',
+  logging: false,
+});
+export default sequelize;
+</file>
+
+<file path="src/api/server.db-init.js">
+import { sequelize } from './db.js';
+import User from './models/User.js';
+import Job from './models/Job.js';
+
+export const initDB = async () => {
+  try {
+    await sequelize.authenticate();
+    await sequelize.sync({ alter: true });
+    console.log('✅ PostgreSQL connected & models synced');
+  } catch (err) {
+    console.error('❌ DB Connection Error:', err);
+  }
+};
+</file>
+
+<file path="src/api/server.js">
+import express from 'express';
+import queue from '../queue/queue.js';
+import { PORT } from '../config/env.js';
+import IORedis from 'ioredis';
+import { REDIS_URL } from '../config/env.js';
+
+const app = express();
+app.use(express.json());
+
+// test redis connection
+const r = new IORedis(REDIS_URL);
+r.on('connect', () => console.log('✅ Connected to Redis at', REDIS_URL));
+r.on('error', err => console.error('❌ Redis error:', err));
+
+app.get('/', (req, res) => res.send('🚀 elweb-scraping API is running!'));
+
+app.get('/test/node', async (req, res) => {
+  try {
+    const job = await queue.add('scrape', { lang: 'node', script: 'src/tests/test_node.js', args: {} });
+    res.json({ status: 'queued', jobId: job.id, lang: 'node' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/test/python', async (req, res) => {
+  try {
+    const job = await queue.add('scrape', { lang: 'python', script: 'src/tests/test_python.py', args: {} });
+    res.json({ status: 'queued', jobId: job.id, lang: 'python' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/job', async (req, res) => {
+  const { lang='node', script, args={} } = req.body;
+  if (!script) return res.status(400).json({ error: 'script required' });
+  try {
+    const job = await queue.add('scrape', { lang, script, args });
+    res.json({ status: 'queued', jobId: job.id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`🚀 API server running on port ${PORT}`));
+</file>
+
+<file path="src/config/env.js">
+import dotenv from 'dotenv';
+dotenv.config();
+
+export const REDIS_URL =
+  process.env.REDIS_URL ||
+  `redis://${process.env.REDIS_HOST || 'redis'}:${process.env.REDIS_PORT || 6379}`;
+
+export const PORT = parseInt(process.env.PORT || '8000', 10);
+export const RESULTS_PATH = process.env.RESULTS_PATH || './storage/results';
+export const API_CONCURRENCY = parseInt(process.env.API_CONCURRENCY || '3', 10);
+
+console.log('✅ Environment loaded:', {
+  REDIS_URL,
+  PORT,
+  API_CONCURRENCY,
+  RESULTS_PATH,
+});
+</file>
+
+<file path="src/queue/queue.js">
+import pkg from 'bullmq';
+import IORedis from 'ioredis';
+import { REDIS_URL } from '../config/env.js';
+
+const { Queue, QueueScheduler } = pkg;
+
+const connection = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
+
+// create queue
+export const queue = new Queue('scrape', { connection });
+
+// create scheduler robustly (works across BullMQ versions)
+let scheduler;
+if (typeof QueueScheduler === 'function') {
+  try {
+    scheduler = new QueueScheduler('scrape', { connection });
+  } catch (e) {
+    // if factory style
+    scheduler = QueueScheduler('scrape', { connection });
+  }
+} else if (QueueScheduler?.default) {
+  try {
+    scheduler = new QueueScheduler.default('scrape', { connection });
+  } catch (e) {
+    scheduler = QueueScheduler.default('scrape', { connection });
+  }
+}
+
+if (scheduler?.waitUntilReady) {
+  await scheduler.waitUntilReady();
+}
+
+console.log('✅ Queue + Scheduler ready using Redis:', REDIS_URL);
+
+export default queue;
+</file>
+
+<file path="src/tests/api/health.test.js">
+import fetch from "node-fetch";
+
+test("API health route should respond", async () => {
+  const res = await fetch("http://api:8000/");
+  const text = await res.text();
+
+  expect(text.includes("API")).toBe(true);
+});
+</file>
+
+<file path="src/tests/api/queue.test.js">
+import fetch from "node-fetch";
+
+test("Queue: node job should be queued successfully", async () => {
+  const res = await fetch("http://api:8000/test/node");
+  const json = await res.json();
+
+  expect(json.status).toBe("queued");
+  expect(json.jobId).toBeDefined();
+});
+</file>
+
+<file path="src/tests/python/test_stub_worker.py">
+def test_python_stub():
+    assert 1 == 1
+</file>
+
+<file path="src/tests/workers/node-worker.test.js">
+import Redis from "ioredis";
+
+const redis = new Redis("redis://redis:6379");
+
+test("Worker should pick node job from queue", async () => {
+  await redis.flushall();
+
+  // Submit a job manually
+  await redis.lpush("bull:scrape:wait", JSON.stringify({
+    name: "manualJob",
+    data: { script: "src/tests/test_node.js", args: {} }
+  }));
+
+  // Wait for worker to process
+  await new Promise(r => setTimeout(r, 2000));
+
+  const logs = await redis.keys("bull:*");
+  expect(logs.length).toBeGreaterThan(0);
+
+  redis.disconnect();
+});
+</file>
+
+<file path="src/tests/workers/python-worker.test.js">
+import fetch from "node-fetch";
+
+test("Python stub job should be queued", async () => {
+  const res = await fetch("http://api:8000/test/python");
+  const json = await res.json();
+
+  expect(json.status).toBe("queued");
+  expect(json.lang).toBe("python");
+});
+</file>
+
+<file path="src/tests/test_node.js">
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+
+(async () => {
+  console.log("🌐 Node test started...");
+  try {
+    const res = await axios.get('https://httpbin.org/ip', { timeout: 10000 });
+    console.log("✅ Raw response:", res.data);
+    const origin = res.data && res.data.origin ? res.data.origin : JSON.stringify(res.data);
+    console.log("🧠 Your public IP (from httpbin):", origin);
+  } catch (e) {
+    console.error("❌ Request failed:", e.message);
+    process.exit(1);
+  }
+})();
+</file>
+
+<file path="src/tests/test_python.py">
+import requests, json, sys, time
+print("🌐 Python test started...")
+try:
+    r = requests.get("https://httpbin.org/ip", timeout=10)
+    r.raise_for_status()
+    print("✅ Status:", r.status_code)
+    print("🧠 Response JSON:", json.dumps(r.json(), indent=2))
+except Exception as e:
+    print("❌ Error:", str(e))
+    sys.exit(1)
+</file>
+
+<file path="src/workers/node/worker.js">
+import pkg from 'bullmq';
+import IORedis from 'ioredis';
+import { REDIS_URL, RESULTS_PATH, API_CONCURRENCY } from '../../config/env.js';
+import { spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+
+const { Worker } = pkg;
+
+const connection = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
+
+console.log('🔧 Loaded REDIS_URL:', REDIS_URL);
+
+const worker = new Worker('scrape', async job => {
+  const { lang, script, args } = job.data;
+  console.log(`[node-worker] job ${job.id} script=${script} lang=${lang}`);
+
+  fs.mkdirSync(RESULTS_PATH, { recursive: true });
+  const outFile = path.join(RESULTS_PATH, `${job.id}.log`);
+  const outStream = fs.createWriteStream(outFile, { flags: 'a' });
+
+  let cmd, cmdArgs;
+  if (lang === 'python' || script.endsWith('.py')) {
+    cmd = 'python';
+    cmdArgs = [script, ...Object.values(args || {})];
+  } else {
+    cmd = 'node';
+    cmdArgs = [script, ...Object.values(args || {})];
+  }
+
+  const proc = spawn(cmd, cmdArgs, { shell: true });
+
+  proc.stdout.on('data', d => {
+    outStream.write(d);
+    process.stdout.write(d);
+  });
+  proc.stderr.on('data', d => {
+    outStream.write(d);
+    process.stderr.write(d);
+  });
+
+  return new Promise((resolve, reject) => {
+    proc.on('close', code => {
+      console.log(`[node-worker] job ${job.id} finished code=${code}`);
+      outStream.end();
+      resolve({ code });
+    });
+    proc.on('error', err => {
+      console.error('[node-worker] spawn error', err);
+      outStream.end();
+      reject(err);
+    });
+  });
+}, { connection, concurrency: API_CONCURRENCY });
+
+worker.on('failed', (job, err) => {
+  console.error(`[node-worker] job ${job.id} failed:`, err);
+});
+
+console.log('Node worker started and listening for jobs...');
+</file>
+
+<file path="src/workers/python/python_worker.py">
+# Python worker stub - actual python tasks are executed by node worker spawning python scripts.
+print("Python worker container ready (stub).")
+</file>
+
+<file path=".dockerignore">
+storage/db-data
+storage/results
+node_modules
+.git
+.gitignore
+.env
+</file>
+
+<file path="docker-compose.addon.yml">
+version: '3.9'
+services:
+  db:
+    image: postgres:16
+    container_name: elweb-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: eluser
+      POSTGRES_PASSWORD: elpass
+      POSTGRES_DB: elweb
+    volumes:
+      - ./storage/db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: elweb-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+    ports:
+      - "5050:80"
+</file>
+
+<file path="docker-compose.test.yml">
+services:
+  tests:
+    image: python:3.11-slim
+    container_name: elweb-tests
+    depends_on:
+      - api
+      - worker-node
+      - worker-python
+      - db
+      - redis
+    volumes:
+      - ./:/app
+    working_dir: /app
+    command: >
+      sh -c "
+        pip install --no-cache-dir pytest requests &&
+        pytest -q
+      "
+</file>
+
+<file path="docker-compose.yml">
+version: '3.9'
+services:
+  redis:
+    image: redis:alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+
+  worker-node:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    env_file: .env
+    depends_on:
+      - redis
+
+  worker-python:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.python
+    env_file: .env
+    depends_on:
+      - redis
+    volumes:
+      - ./storage/results:/data/results
+</file>
+
+<file path="jest.config.js">
+export default {
+  testEnvironment: "node",
+  transform: {}
+};
+</file>
+
+<file path="pytest.ini">
+[pytest]
+pythonpath = .
+</file>
+
+<file path="README.md">
+# elweb-scraping (v6)
+
+## Quick start (WSL / Linux)
+
+1. Unzip and enter folder:
+   ```
+   unzip elweb-scraping-v6.zip -d ~/elweb-scraping
+   cd ~/elweb-scraping
+   ```
+
+2. Build & run:
+   ```
+   docker compose up --build
+   ```
+
+3. Test endpoints:
+   ```
+   curl http://localhost:8000/test/node
+   curl http://localhost:8000/test/python
+   ```
+
+4. Logs/results:
+   - Worker output is printed to container logs.
+   - Detailed job logs are written to `storage/results/{jobid}.log` (mounted into host).
+
+## Notes
+- Images include `curl` and `ping` for debugging.
+- Node's `package.json` includes required dependencies.
+- The Node worker will spawn Python scripts for python jobs.
+</file>
+
+<file path=".gitignore">
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+
+# Docker
+storage/results/
+storage/db-data/
+*.log
+
+# Environment & system
+.env
+.DS_Store
+pgadmin/
+</file>
+
+<file path="package.json">
+{
+  "name": "elweb-scraping",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/api/server.js",
+    "worker-node": "node src/workers/node/worker.js",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "test:api": "jest tests/api",
+    "test:workers": "jest tests/workers"
+  },
+  "dependencies": {
+    "axios": "^1.5.0",
+    "cheerio": "^1.0.0-rc.12",
+    "express": "^4.18.2",
+    "bullmq": "^4.12.2",
+    "ioredis": "^5.4.1",
+    "dotenv": "^16.4.5"
+  }
+}
+</file>
+
+</files>
