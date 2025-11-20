@@ -1,7 +1,22 @@
 FROM node:20-alpine
+
 RUN apk add --no-cache curl iputils python3 py3-pip
 WORKDIR /app
-COPY package*.json ./
+
+# Install project dependencies
+COPY package.json package-lock.json ./
 RUN npm install --production
-COPY . .
+# After npm install
+RUN mkdir -p /data/scripts && rm -rf /data/scripts/node_modules && ln -s /app/node_modules /data/scripts/node_modules
+ENV NODE_PATH=/app/node_modules
+# Make installed modules available globally
+# ENV NODE_PATH=/app/node_modules
+ENV NODE_OPTIONS="--experimental-modules --es-module-specifier-resolution=node"
+
+# Copy worker code
+COPY src ./src
+
+# Critical: allow uploaded scripts to import libs
+RUN mkdir -p /data/scripts && ln -s /app/node_modules /data/scripts/node_modules
+
 CMD ["node", "src/workers/node/worker.js"]

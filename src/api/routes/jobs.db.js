@@ -78,9 +78,11 @@ router.post("/create-bulk", requireAuth, upload.single("inputFile"), async (req,
     await parent.save();
 
     // Stream CSV and enqueue rows in chunks
+    
     let total = 0;
     let buffer = [];
     let rowIndex = 0;
+    let firstRow = true;  // <--- ADD THIS FLAG
 
     const stream = fs.createReadStream(destPath).pipe(
       csvParser({
@@ -92,7 +94,16 @@ router.post("/create-bulk", requireAuth, upload.single("inputFile"), async (req,
       })
     );
 
+
     stream.on("data", (row) => {
+      // Skip the header row completely
+      if (firstRow) {
+        firstRow = false;
+        // If row has no actual values, skip it
+        if (Object.values(row).every(v => !v || String(v).trim() === "")) return;
+        return;  // ALWAYS SKIP FIRST DATA EVENT
+      }
+
       // ignore empty rows
       if (!Object.values(row).some((v) => v && String(v).trim() !== "")) return;
 

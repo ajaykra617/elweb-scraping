@@ -1,3 +1,4 @@
+
 version: '3.9'
 services:
   redis:
@@ -28,8 +29,14 @@ services:
     depends_on:
       - redis
     volumes:
-    - ./storage/results:/data/results
-    - ./storage/scripts:/data/scripts
+      - ./storage/results:/data/results
+      - ./storage/scripts:/data/scripts
+    command: >
+      sh -c "
+        rm -rf /data/scripts/node_modules &&
+        ln -s /app/node_modules /data/scripts/node_modules &&
+        node src/workers/node/worker.js
+      "
 
   worker-python:
     build:
@@ -41,19 +48,26 @@ services:
     volumes:
       - ./storage/results:/data/results
       - ./storage/scripts:/data/scripts
+ 
   worker-batch-row:
     build:
       context: .
-      dockerfile: docker/Dockerfile.node   # <-- this is the correct Dockerfile
-    command: node src/workers/node/batch_row_worker.js
+      dockerfile: docker/Dockerfile.node
     env_file: .env
     volumes:
-      - ./src:/app/src
       - ./storage/results:/data/results
       - ./storage/uploads:/data/uploads
       - ./storage/scripts:/data/scripts
     depends_on:
       - redis
+    command: >
+      sh -c "
+        echo '🟦 Creating symlink for node_modules...' &&
+        rm -rf /data/scripts/node_modules &&
+        ln -s /app/node_modules /data/scripts/node_modules &&
+        echo '🟩 Symlink created. Starting worker...' &&
+        node src/workers/node/batch_row_worker.js
+      "
     environment:
       - REDIS_URL=redis://redis:6379
       - WORKER_CONCURRENCY=10
