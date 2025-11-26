@@ -1,7 +1,13 @@
 FROM python:3.11-slim
+
 WORKDIR /app
-RUN apt-get update && apt-get install -y curl iputils-ping && rm -rf /var/lib/apt/lists/*
-COPY src/workers/python/python_worker.py /app/python_worker.py
-RUN pip install --no-cache-dir redis requests
-COPY . .
-CMD ["python", "python_worker.py"]
+
+# Install packages
+RUN pip install --no-cache-dir fastapi uvicorn redis requests
+
+# Copy python service ONLY
+COPY src/workers/python/python_service/ /app/
+
+EXPOSE 9000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "9000"]

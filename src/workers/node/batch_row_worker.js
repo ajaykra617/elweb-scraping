@@ -7,6 +7,26 @@ import fs from "fs";
 import path from "path";
 import { REDIS_URL, QUEUE_PREFIX } from "../../config/env.js";
 import JobModel from "../../api/models/Job.js";
+import axios from "axios";
+
+async function runPythonRemote(payload) {
+  const PY_URL = process.env.PY_WORKER_URL || "http://python-service:9000/run";
+  const res = await axios.post(PY_URL, payload, { timeout: 300000 });
+  return res.data;
+}
+
+// NEW IMPORTS (Python RPC + Piscina worker)
+import Piscina from "piscina";
+import { fileURLToPath } from "url";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const piscina = new Piscina({
+  filename: path.join(__dirname, "piscina_worker.mjs"),
+  maxThreads: Number(process.env.PISCINA_THREADS || 6)
+});
+
+import { runPythonRPC } from "./python_client.mjs";
 
 const redisConnection = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
 
@@ -20,207 +40,291 @@ function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-// robust move (handles EXDEV)
-function moveFileFallback(src, dest) {
-  try {
-    fs.renameSync(src, dest);
-  } catch (err) {
-    fs.copyFileSync(src, dest);
-    try { fs.unlinkSync(src); } catch(e){}
-  }
-}
-
-// write an atomic append to a file (sync is fine here for log correctness)
+// write atomic append
 function appendToFile(filePath, data) {
-  try {
-    fs.appendFileSync(filePath, data);
-  } catch (e) {
-    // best-effort, log to console
-    console.warn("appendToFile error:", e?.message || e);
-  }
+  try { fs.appendFileSync(filePath, data); }
+  catch (e) { console.warn("appendToFile error:", e.message); }
 }
 
 async function compileMasterResultsIfComplete(jobId) {
   try {
     const job = await JobModel.findByPk(jobId);
-    if (!job) return;
+    if (!job || !job.totalItems) return;
+    if (job.processedRows < job.totalItems) return;
 
-    // If totals are unknown, skip
-    if (!job.totalItems || job.totalItems === 0) return;
-
-    if (job.processedRows < job.totalItems) {
-      return; // not complete yet
-    }
-
-    // Build master CSV
     const jobDir = `/data/results/job_${jobId}`;
     const rowsDir = path.join(jobDir, "rows");
+
     if (!fs.existsSync(rowsDir)) return;
 
     const files = fs.readdirSync(rowsDir).filter(f => f.endsWith(".json"));
-    files.sort((a,b) => {
-      const na = Number(a.replace(/\D+/g,"")) || 0;
-      const nb = Number(b.replace(/\D+/g,"")) || 0;
-      return na - nb;
-    });
+    files.sort((a,b) => Number(a.replace(/\D+/g,"")) - Number(b.replace(/\D+/g,"")));
 
     const masterPath = path.join(jobDir, "master_results.csv");
-    // header
     fs.writeFileSync(masterPath, "rowIndex,result_json\n");
 
     for (const f of files) {
       try {
-        const full = path.join(rowsDir, f);
-        const raw = fs.readFileSync(full, "utf8");
-        const idx = Number(f.replace(/\D+/g,"")) || 0;
-        // sanitize newlines
-        const safe = JSON.stringify(JSON.parse(raw)).replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+        const raw = fs.readFileSync(path.join(rowsDir, f), "utf8");
+        const idx = Number(f.replace(/\D+/g,""));
+        const safe = JSON.stringify(JSON.parse(raw)).replace(/\n/g, "\\n");
         fs.appendFileSync(masterPath, `${idx},${safe}\n`);
-      } catch (e) {
-        console.warn("Skipping result file on master compile:", f, e?.message || e);
-      }
+      } catch (e) {}
     }
 
-    // Optionally update job record with result path and mark completed
-    await job.update({ resultPath: masterPath, status: "completed", finishedAt: new Date() });
-    console.log(`✅ Master results written for job ${jobId} -> ${masterPath}`);
+    await job.update({ resultPath: masterPath, status:"completed", finishedAt:new Date() });
+    console.log("MASTER CSV CREATED for job", jobId);
   } catch (e) {
-    console.warn("compileMasterResultsIfComplete error:", e?.message || e);
+    console.warn("master compile error:", e.message);
   }
 }
 
+//
+//  🔥🔥🔥 REPLACED runRow() WITH PYTHON-RPC + PISCINA + FALLBACK TO SPAWN
+//
 async function runRow(scriptPath, rowData, jobId, rowIndex) {
-  // Prepare directories & file paths
   const jobDir = `/data/results/job_${jobId}`;
   const logsDir = path.join(jobDir, "logs");
   const rowsDir = path.join(jobDir, "rows");
+
   ensureDir(logsDir);
   ensureDir(rowsDir);
 
   const logFile = path.join(logsDir, `row_${rowIndex}.log`);
   const resultFile = path.join(rowsDir, `row_${rowIndex}.json`);
 
-  // Ensure log file exists
-  try { fs.writeFileSync(logFile, `ROW DATA: ${JSON.stringify(rowData)}\n`); } catch(e){}
+  fs.writeFileSync(logFile, `ROW DATA: ${JSON.stringify(rowData)}\n`);
 
-  // Decide runner (python vs node)
+  // 1️⃣ ABORT CHECK
+  try {
+    const j = await JobModel.findByPk(jobId);
+    if (j?.status === "aborted") {
+      appendToFile(logFile, "⛔ SKIPPED - JOB ABORTED\n");
+      fs.writeFileSync(resultFile, JSON.stringify({ code:1, out:"Aborted", err:"" }));
+      await JobModel.increment({ processedRows:1, failedCount:1 }, { where:{ id:jobId }});
+      setTimeout(() => compileMasterResultsIfComplete(jobId), 200);
+      return { code:1, out:"Aborted", err:"" };
+    }
+  } catch(err){}
+
   const ext = path.extname(scriptPath).toLowerCase();
   const isPy = ext === ".py";
-  const cmd = isPy ? (process.env.PYTHON_BIN || "python3") : "node";
+  const isJs = ext === ".js" || ext === ".mjs";
 
-  // Pass rowData as JSON string argument – script can parse process.argv[2]
-  const args = [scriptPath, JSON.stringify(rowData), `--logFile=${logFile}`, `--resultFile=${resultFile}`];
+  //
+  // 2️⃣ PYTHON SCRIPTS → PYTHON-SERVICE RPC
+  //
+  if (isPy) {
+    try {
+        const rpc = await runPythonRPC({
+  script_path: scriptPath,
+  rowData: rowData,
+  jobId: jobId,
+  rowIndex: rowIndex,
+  resultFile: resultFile,
+  logFile: logFile
+});
 
-  return new Promise((resolve) => {
-    // spawn child WITHOUT shell for safer execution
-    const proc = spawn(cmd, args, { shell: false });
+      const outObj = {
+        code: rpc.code,
+        out: rpc.out,
+        err: rpc.err,
+        rowData,
+        rowIndex,
+        finishedAt: new Date().toISOString()
+      };
 
-    // Stream child's stdout/stderr into log file as they arrive
-    proc.stdout.on("data", (d) => {
-      const s = d.toString();
-      appendToFile(logFile, s);
-    });
-
-    proc.stderr.on("data", (d) => {
-      const s = d.toString();
-      appendToFile(logFile, s);
-    });
-
-    let out = "";
-    let err = "";
-
-    // Keep capturing full output to store in result JSON (bounded)
-    proc.stdout.on("data", (d) => { out += d.toString(); });
-    proc.stderr.on("data", (d) => { err += d.toString(); });
-
-    proc.on("close", async (code) => {
-      try {
-        // Finalize log with exit code
-        appendToFile(logFile, `\nEXIT=${code}\n`);
-
-        // Write per-row result JSON (overwrites)
-        const resultObj = { code, out, err, rowData, rowIndex, finishedAt: new Date().toISOString() };
-        try {
-          fs.writeFileSync(resultFile, JSON.stringify(resultObj));
-        } catch (e) {
-          console.warn("Failed writing result file:", e?.message || e);
-        }
-
-        // Update DB counts (increment)
-        await JobModel.increment(
-          {
-            processedRows: 1,
-            successCount: code === 0 ? 1 : 0,
-            failedCount: code === 0 ? 0 : 1
-          },
-          { where: { id: jobId } }
-        ).catch(e => {
-          console.warn("JobModel.increment warning:", e?.message || e);
-        });
-
-        // After increment, check if job is complete and compile master if so
-        // Small delay to allow DB to settle
-        setTimeout(() => compileMasterResultsIfComplete(jobId), 200);
-
-      } catch (e) {
-        console.warn("runRow post-processing error:", e?.message || e);
-      }
-
-      resolve({ code, out, err });
-    });
-
-    proc.on("error", async (e) => {
-      appendToFile(logFile, `\nPROC ERROR: ${e.stack || e}\n`);
-      // write failed result
-      try {
-        fs.writeFileSync(resultFile, JSON.stringify({ code: 1, out: "", err: String(e), rowData, rowIndex }));
-      } catch(e){}
+      fs.writeFileSync(resultFile, JSON.stringify(outObj));
 
       await JobModel.increment(
-        { processedRows: 1, failedCount: 1 },
-        { where: { id: jobId } }
-      ).catch(()=>{});
+        {
+          processedRows:1,
+          successCount: rpc.code===0 ? 1 : 0,
+          failedCount: rpc.code===0 ? 0 : 1
+        },
+        { where:{ id:jobId } }
+      );
 
       setTimeout(() => compileMasterResultsIfComplete(jobId), 200);
+      return { code: rpc.code, out: rpc.out, err: rpc.err };
 
-      resolve({ code: 1, out: "", err: e.message || String(e) });
+    } catch (err) {
+      appendToFile(logFile, "PYTHON RPC ERROR: " + err.message);
+      fs.writeFileSync(resultFile, JSON.stringify({ code:1, out:"", err:err.message }));
+      return { code:1, out:"", err:err.message };
+    }
+  }
+
+  //
+  // 3️⃣ NODE MODULE SCRIPTS → TRY PISCINA
+  //
+  if (isJs) {
+    try {
+      let full = scriptPath;
+      if (!path.isAbsolute(full)) {
+        const p = path.join("/data/scripts", scriptPath);
+        if (fs.existsSync(p)) full = p;
+      }
+
+      const res = await piscina.run(
+        { scriptPath: full, row: rowData, resultFile, logFile },
+        { name: "runUserModule" }
+      );
+
+      const outObj = {
+        code: res.code || 0,
+        out: res.out || "",
+        err: res.err || "",
+        rowData,
+        rowIndex,
+        finishedAt: new Date().toISOString()
+      };
+
+      fs.writeFileSync(resultFile, JSON.stringify(outObj));
+
+      await JobModel.increment(
+        {
+          processedRows:1,
+          successCount: outObj.code===0 ? 1 : 0,
+          failedCount: outObj.code===0 ? 0 : 1
+        },
+        { where:{ id:jobId }}
+      );
+
+      setTimeout(() => compileMasterResultsIfComplete(jobId), 200);
+      return outObj;
+
+    } catch (err) {
+      appendToFile(logFile, `Piscina failed → fallback spawn: ${err.message}\n`);
+    }
+  }
+
+  //
+  // 4️⃣ FALLBACK → ORIGINAL BEHAVIOR (SPAWN)
+  //
+  if(isJs) {
+    const cmd = "node";
+  }
+  if (isPy) {
+  appendToFile(logFile, "📡 Sending task to Python service...\n");
+
+  try {
+        const result = await runPythonRemote({
+  script_path: scriptPath,
+  rowData: rowData,
+  jobId: jobId,
+  rowIndex: rowIndex,
+  resultFile: resultFile,
+  logFile: logFile
+});
+    // Save result JSON same as node
+    fs.writeFileSync(resultFile, JSON.stringify({
+      code: result.code,
+      out: result.out,
+      err: result.err,
+      rowData,
+      rowIndex,
+      finishedAt: new Date().toISOString(),
+    }));
+
+    await JobModel.increment(
+      {
+        processedRows: 1,
+        successCount: result.code === 0 ? 1 : 0,
+        failedCount: result.code === 0 ? 0 : 1
+      },
+      { where: { id: jobId } }
+    );
+
+    setTimeout(() => compileMasterResultsIfComplete(jobId), 200);
+    return result;
+
+  } catch (err) {
+    appendToFile(logFile, `Python worker error: ${err.message}\n`);
+
+    fs.writeFileSync(resultFile, JSON.stringify({
+      code: 1,
+      out: "",
+      err: err.message,
+      rowData,
+      rowIndex
+    }));
+
+    await JobModel.increment(
+      { processedRows: 1, failedCount: 1 },
+      { where: { id: jobId } }
+    );
+
+    setTimeout(() => compileMasterResultsIfComplete(jobId), 200);
+    return { code: 1, out: "", err: err.message };
+  }
+}
+  const args = [
+    scriptPath,
+    JSON.stringify(rowData),
+    `--logFile=${logFile}`,
+    `--resultFile=${resultFile}`
+  ];
+
+  return new Promise((resolve) => {
+    const proc = spawn(cmd, args, { shell:false });
+
+    let out = "", err = "";
+
+    proc.stdout.on("data", d => { out += d; appendToFile(logFile, d.toString()); });
+    proc.stderr.on("data", d => { err += d; appendToFile(logFile, d.toString()); });
+
+    proc.on("close", async (code) => {
+      fs.writeFileSync(resultFile, JSON.stringify({
+        code, out, err, rowData, rowIndex, finishedAt:new Date().toISOString()
+      }));
+
+      await JobModel.increment(
+        {
+          processedRows:1,
+          successCount: code===0?1:0,
+          failedCount: code===0?0:1
+        },
+        { where:{id:jobId}}
+      );
+
+      setTimeout(() => compileMasterResultsIfComplete(jobId), 200);
+      resolve({ code, out, err });
     });
   });
 }
 
-// Processor used by Worker
+// Worker processor
 async function processorFn(job) {
   const data = job.data || {};
-  const parentJobId = data.parentJobId || data.jobId || data.parent_id;
-  const rowIndex = data.rowIndex || data.index || 0;
-  const rowData = data.rowData || data.row || {};
-  const script_path = data.script_path || data.scriptPath || data.script;
+  const parentJobId = data.parentJobId;
+  const rowIndex = data.rowIndex;
+  const rowData = data.rowData;
+  const scriptPath = data.script_path;
 
-  if (!parentJobId || !script_path) {
-    throw new Error("Invalid job payload: missing parentJobId or script_path");
-  }
+  if (!parentJobId || !scriptPath)
+    throw new Error("Invalid job payload");
 
-  // Run via p-limit to ensure total children stay under WORKER_MAX_CHILDREN
-  return limit(() => runRow(script_path, rowData, parentJobId, rowIndex));
+  return limit(() => runRow(scriptPath, rowData, parentJobId, rowIndex));
 }
 
-// Create the Worker (uses configurable prefix)
 const worker = new Worker(
   "batch-row",
   processorFn,
   {
     connection: redisConnection,
     concurrency: WORKER_CONCURRENCY,
+    settings: {
+      backoffStrategy: (n) => Math.min(5000, n*500),
+      lockDuration: 30000,
+      stalledInterval: 30000
+    },
     prefix: QUEUE_PREFIX || undefined
   }
 );
 
-worker.on("completed", (job) => {
-  // completed event handled per-row; master compiled after DB increments in runRow
-});
-
 worker.on("failed", (job, err) => {
-  console.error("batch-row job failed", job?.id, err?.message || err);
+  console.error("batch-row failed:", job?.id, err.message);
 });
 
-console.log("batch-row worker started (node). Concurrency:", WORKER_CONCURRENCY, "Max Children:", WORKER_MAX_CHILDREN, "Prefix:", QUEUE_PREFIX);
+console.log("batch-row worker started", WORKER_CONCURRENCY);

@@ -38,7 +38,7 @@ services:
         node src/workers/node/worker.js
       "
 
-  worker-python:
+  python-service:
     build:
       context: .
       dockerfile: docker/Dockerfile.python
@@ -48,7 +48,9 @@ services:
     volumes:
       - ./storage/results:/data/results
       - ./storage/scripts:/data/scripts
- 
+    ports:
+      - "9000:9000"       # <-- IMPORTANT
+  
   worker-batch-row:
     build:
       context: .

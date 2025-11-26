@@ -25,8 +25,11 @@ sequelize.sync({ alter: true })
 const app = express();
 
 app.use(cors({
-  origin: "http://localhost:3000",
-  credentials: true,
+  origin: [
+    "http://localhost:3000",
+    "http://20.64.237.238:3000"
+  ],
+  credentials: true
 }));
 
 app.use(express.json());

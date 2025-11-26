@@ -26,7 +26,6 @@ function moveFileFallback(src, dest) {
   try {
     fs.renameSync(src, dest);
   } catch (err) {
-    // EXDEV or cross-device link — fallback to copy + unlink
     fs.copyFileSync(src, dest);
     fs.unlinkSync(src);
   }
@@ -34,8 +33,6 @@ function moveFileFallback(src, dest) {
 
 /* ============================================================
    CREATE BULK (protected)
-   - inputFile: csv
-   - script_id: id of script (must belong to user)
    ============================================================ */
 router.post("/create-bulk", requireAuth, upload.single("inputFile"), async (req, res) => {
   try {
@@ -67,22 +64,34 @@ router.post("/create-bulk", requireAuth, upload.single("inputFile"), async (req,
       status: "queued",
     });
 
-    // Persist CSV into job folder
+    // Create job uploads folder
     const jobFolder = `/data/uploads/job_${parent.id}`;
     if (!fs.existsSync(jobFolder)) fs.mkdirSync(jobFolder, { recursive: true });
 
+    /* ---------------------------------------
+       FIX MOVED HERE
+       Compute priority BEFORE moving the file
+    ----------------------------------------*/
+    let priorityValue = 5;
+    try {
+      const stats = fs.statSync(req.file.path);
+      priorityValue = stats.size < 1_000_000 ? 1 : 5;
+    } catch (e) {
+      console.warn("WARN: could not stat uploaded file:", e.message);
+    }
+
+    // Now move uploaded file
     const destPath = path.join(jobFolder, `input_${Date.now()}.csv`);
     moveFileFallback(req.file.path, destPath);
 
     parent.input_file_path = destPath;
     await parent.save();
 
-    // Stream CSV and enqueue rows in chunks
-    
+    // Stream CSV and enqueue rows
     let total = 0;
     let buffer = [];
     let rowIndex = 0;
-    let firstRow = true;  // <--- ADD THIS FLAG
+    let firstRow = true;
 
     const stream = fs.createReadStream(destPath).pipe(
       csvParser({
@@ -94,17 +103,13 @@ router.post("/create-bulk", requireAuth, upload.single("inputFile"), async (req,
       })
     );
 
-
     stream.on("data", (row) => {
-      // Skip the header row completely
       if (firstRow) {
         firstRow = false;
-        // If row has no actual values, skip it
         if (Object.values(row).every(v => !v || String(v).trim() === "")) return;
-        return;  // ALWAYS SKIP FIRST DATA EVENT
+        return;
       }
 
-      // ignore empty rows
       if (!Object.values(row).some((v) => v && String(v).trim() !== "")) return;
 
       rowIndex++;
@@ -122,6 +127,7 @@ router.post("/create-bulk", requireAuth, upload.single("inputFile"), async (req,
           attempts: 3,
           backoff: { type: "exponential", delay: 3000 },
           removeOnComplete: true,
+          priority: priorityValue,
         },
       });
 
@@ -135,9 +141,12 @@ router.post("/create-bulk", requireAuth, upload.single("inputFile"), async (req,
       if (buffer.length > 0) {
         await bulkQueue.addBulk(buffer).catch(console.error);
       }
+
       await parent.update({ totalItems: total, status: "queued" });
-      console.log(`✅ Bulk enqueue complete: job=${parent.id}, rows=${total}`);
-      return res.json({ success: true, jobId: parent.id, totalRows: total });
+
+      console.log(`✅ Bulk enqueue complete: job=${parent.id}, rows=${total}, priority=${priorityValue}`);
+
+      return res.json({ success: true, jobId: parent.id, totalRows: total, priority: priorityValue });
     });
 
     stream.on("error", async (err) => {
@@ -145,11 +154,13 @@ router.post("/create-bulk", requireAuth, upload.single("inputFile"), async (req,
       await parent.update({ status: "failed" }).catch(() => {});
       return res.status(500).json({ error: "CSV parse failed" });
     });
+
   } catch (err) {
     console.error("create-bulk error:", err);
     return res.status(500).json({ error: err.message || "Server error" });
   }
 });
+
 
 /* ============================================================
    (Optional) Legacy single create (protected)
@@ -259,21 +270,32 @@ router.get("/:id/rows/:rowIndex/file/:file", requireAuth, async (req, res) => {
 /* ============================================================
    LIST ROW RESULTS (PRIVATE)
    ============================================================ */
+// ============================================================
+// PAGINATED ROW LIST (PRIVATE)
+// /jobs/:id/rows?page=1&pageSize=23&status=success|failed|pending
+// ============================================================
+/* ============================================================
+   PAGINATED ROWS WITH FILTER
+   /jobs/:id/rows?page=1&limit=23&status=success
+   ============================================================ */
 router.get("/:id/rows", requireAuth, async (req, res) => {
   try {
-    const job = await Job.findOne({
-      where: { id: req.params.id, userId: req.user.id },
-    });
+    const { id } = req.params;
+    const { page = 1, limit = 23, status = "all" } = req.query;
 
+    const job = await Job.findOne({
+      where: { id, userId: req.user.id },
+    });
     if (!job) return res.status(403).json({ error: "Forbidden" });
 
-    const rowsDir = `/data/results/job_${req.params.id}/rows`;
+    const rowsDir = `/data/results/job_${id}/rows`;
 
     if (!fs.existsSync(rowsDir)) {
-      return res.json({ rows: [] });
+      return res.json({ rows: [], totalPages: 1 });
     }
 
-    const files = fs
+    // Load all row files
+    let allFiles = fs
       .readdirSync(rowsDir)
       .filter((f) => f.endsWith(".json"))
       .sort((a, b) => {
@@ -282,19 +304,54 @@ router.get("/:id/rows", requireAuth, async (req, res) => {
         return na - nb;
       });
 
-    const rows = files.map((f) => ({
-      file: f,
-      rowIndex: Number(f.replace(/\D+/g, "")),
-      status: f.includes("json") ? "done" : "pending",
-    }));
+    // Convert to rows with status
+    let allRows = allFiles.map((file) => {
+      const fullPath = path.join(rowsDir, file);
+      let json;
+      try {
+        json = JSON.parse(fs.readFileSync(fullPath, "utf8"));
+      } catch {
+        json = { code: 1 };
+      }
 
-    return res.json({ rows });
+      return {
+        file,
+        rowIndex: Number(file.replace(/\D+/g, "")),
+        status:
+          json.code === 0
+            ? "success"
+            : json.code === 1
+            ? "failed"
+            : "pending",
+      };
+    });
 
+    // Apply filter
+    let filteredRows = allRows;
+    if (status !== "all") {
+      filteredRows = allRows.filter((r) => r.status === status);
+    }
+
+    // Pagination
+    const pageInt = Number(page);
+    const limitInt = Number(limit);
+
+    const start = (pageInt - 1) * limitInt;
+    const end = start + limitInt;
+
+    const pageRows = filteredRows.slice(start, end);
+    const totalPages = Math.max(1, Math.ceil(filteredRows.length / limitInt));
+
+    return res.json({
+      rows: pageRows,
+      totalPages,
+      totalRows: filteredRows.length,
+    });
   } catch (err) {
+    console.error("GET rows error:", err);
     return res.status(500).json({ error: err.message });
   }
 });
-
 
 /* ============================================================
    GET A ROW RESULT JSON (PRIVATE)
@@ -435,6 +492,94 @@ router.get("/:id/results", requireAuth, async (req, res) => {
     if (!fs.existsSync(file)) return res.status(404).send("Results file not found");
 
     return res.sendFile(file);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- ADD: Abort endpoint ----------
+router.post("/:id/abort", requireAuth, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const job = await Job.findOne({ where: { id, userId: req.user.id } });
+    if (!job) return res.status(404).json({ error: "Job not found" });
+
+    // mark DB row as aborted
+    await job.update({ status: "aborted", finishedAt: new Date() });
+
+    // mark Redis key for fast worker checks (expires in 24h)
+    const redis = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
+    await redis.set(`job:aborted:${id}`, "1", "EX", 60 * 60 * 24).catch(()=>{});
+    redis.disconnect?.();
+
+    // Best-effort: try to remove waiting/delayed jobs in bulkQueue that belong to this parent job
+    // NOTE: this is best-effort because BullMQ doesn't provide a single atomic remove by payload.
+    try {
+      const waiting = await bulkQueue.getJobs(["waiting", "delayed", "paused"]);
+      const removePromises = [];
+      for (const qjob of waiting) {
+        try {
+          const data = qjob.data || {};
+          if (data.parentJobId == id || data.jobId == id) {
+            removePromises.push(bulkQueue.removeJobs(qjob.id));
+          }
+        } catch (e) {}
+      }
+      await Promise.allSettled(removePromises);
+    } catch (e) {
+      // ignore — not fatal
+      console.warn("Abort: could not prune queue items:", e?.message || e);
+    }
+
+    return res.json({ success: true, aborted: true });
+  } catch (err) {
+    console.error("Abort job error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+// ---------- END: Abort endpoint ----------
+
+/* ============================================================
+   LIST ALL RESULT FILES IN JOB FOLDER (PRIVATE)
+   ============================================================ */
+router.get("/:id/files", requireAuth, async (req, res) => {
+  try {
+    const job = await Job.findOne({
+      where: { id: req.params.id, userId: req.user.id },
+    });
+    if (!job) return res.status(403).json({ error: "Forbidden" });
+
+    const jobDir = `/data/results/job_${req.params.id}`;
+    if (!fs.existsSync(jobDir))
+      return res.json({ files: [] });
+
+    const allFiles = fs
+      .readdirSync(jobDir)
+      .filter(f => !["logs", "rows"].includes(f)) // skip folders
+      .map(f => ({ name: f }));
+
+    return res.json({ files: allFiles });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+/* ============================================================
+   DOWNLOAD ANY FILE FROM JOB FOLDER (PRIVATE)
+   ============================================================ */
+router.get("/:id/file/:file", requireAuth, async (req, res) => {
+  try {
+    const job = await Job.findOne({
+      where: { id: req.params.id, userId: req.user.id },
+    });
+    if (!job) return res.status(403).json({ error: "Forbidden" });
+
+    const filePath = `/data/results/job_${req.params.id}/${req.params.file}`;
+
+    if (!fs.existsSync(filePath))
+      return res.status(404).send("File not found");
+
+    return res.download(filePath);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
