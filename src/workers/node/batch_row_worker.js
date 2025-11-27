@@ -45,40 +45,213 @@ function appendToFile(filePath, data) {
   try { fs.appendFileSync(filePath, data); }
   catch (e) { console.warn("appendToFile error:", e.message); }
 }
+// ---------- Helpers for master files (paste near top with other functions) ----------
+function safeFilename(f) {
+  return f.replace(/\.\./g, "").replace(/[^a-zA-Z0-9_\-\.]/g, "_");
+}
 
-async function compileMasterResultsIfComplete(jobId) {
+function readAllFiles(dir) {
   try {
-    const job = await JobModel.findByPk(jobId);
-    if (!job || !job.totalItems) return;
-    if (job.processedRows < job.totalItems) return;
-
-    const jobDir = `/data/results/job_${jobId}`;
-    const rowsDir = path.join(jobDir, "rows");
-
-    if (!fs.existsSync(rowsDir)) return;
-
-    const files = fs.readdirSync(rowsDir).filter(f => f.endsWith(".json"));
-    files.sort((a,b) => Number(a.replace(/\D+/g,"")) - Number(b.replace(/\D+/g,"")));
-
-    const masterPath = path.join(jobDir, "master_results.csv");
-    fs.writeFileSync(masterPath, "rowIndex,result_json\n");
-
-    for (const f of files) {
-      try {
-        const raw = fs.readFileSync(path.join(rowsDir, f), "utf8");
-        const idx = Number(f.replace(/\D+/g,""));
-        const safe = JSON.stringify(JSON.parse(raw)).replace(/\n/g, "\\n");
-        fs.appendFileSync(masterPath, `${idx},${safe}\n`);
-      } catch (e) {}
-    }
-
-    await job.update({ resultPath: masterPath, status:"completed", finishedAt:new Date() });
-    console.log("MASTER CSV CREATED for job", jobId);
+    return fs.readdirSync(dir);
   } catch (e) {
-    console.warn("master compile error:", e.message);
+    return [];
   }
 }
 
+function isMasterFile(name) {
+  return /^master_/.test(name);
+}
+
+// Try load archiver (optional). If not available, we will skip zipping.
+let archiver = null;
+try {
+  // prefer dynamic require to avoid breaking ESM builds that don't bundle it
+  // if using native ESM imports in your project you may replace with: import archiver from 'archiver';
+  // but dynamic require is safe here because Node will resolve it if present.
+  // eslint-disable-next-line no-undef
+  archiver = require("archiver");
+} catch (e) {
+  archiver = null;
+  console.warn("archiver not available — zip artifacts will be skipped. Install 'archiver' to enable zipping.");
+}
+
+async function makeZip(outputPath, files, baseDir) {
+  return new Promise((resolve, reject) => {
+    if (!archiver) {
+      return resolve(false);
+    }
+    try {
+      const output = fs.createWriteStream(outputPath);
+      const archive = archiver("zip", { zlib: { level: 6 } });
+      output.on("close", () => resolve(true));
+      archive.on("error", (err) => reject(err));
+      archive.pipe(output);
+      for (const f of files) {
+        const abs = path.join(baseDir, f);
+        // only add if exists and is file
+        try {
+          const st = fs.statSync(abs);
+          if (st.isFile()) {
+            archive.file(abs, { name: f });
+          }
+        } catch (e) {
+          // skip missing file
+        }
+      }
+      archive.finalize();
+    } catch (e) {
+      return reject(e);
+    }
+  });
+}
+
+// ---------- New compileMasterResultsIfComplete implementation ----------
+async function compileMasterResultsIfComplete(jobId) {
+  try {
+    const job = await JobModel.findByPk(jobId);
+    if (!job) return;
+
+    // If totals are unknown, skip
+    if (!job.totalItems || job.totalItems === 0) return;
+
+    if (job.processedRows < job.totalItems) {
+      return; // not complete yet
+    }
+
+    const jobDir = `/data/results/job_${jobId}`;
+    const rowsDir = path.join(jobDir, "rows");
+    if (!fs.existsSync(rowsDir)) return;
+
+    // List files in rowsDir excluding any master_ files
+    const allFiles = readAllFiles(rowsDir).filter(f => !isMasterFile(f));
+
+    // Partition files by extension and by "row_" prefix
+    const grouped = {};
+    for (const f of allFiles) {
+      // only consider files that appear to be row outputs
+      if (!/^row_/.test(f)) continue;
+      const extMatch = (f.match(/\.(\w+)$/) || [null, ""]).slice(1)[0] || "";
+      const ext = extMatch.toLowerCase();
+      if (!grouped[ext]) grouped[ext] = [];
+      grouped[ext].push(f);
+    }
+
+    // ---------- 1) MASTER JSON (Option A: JSON string) ----------
+    const jsonFiles = (grouped["json"] || []).sort((a,b) => {
+      return Number(a.replace(/\D+/g,"")) - Number(b.replace(/\D+/g,""));
+    });
+
+    const masterJsonPath = path.join(jobDir, "master_json.csv");
+    // header
+    fs.writeFileSync(masterJsonPath, "rowIndex,result_json\n");
+
+    for (const f of jsonFiles) {
+      try {
+        const full = path.join(rowsDir, f);
+        const raw = fs.readFileSync(full, "utf8").trim();
+        // keep JSON as provided, but ensure it's valid JSON — if not, store raw string escaped
+        let safeJsonString;
+        try {
+          // ensure we can parse (if already JSON)
+          const parsed = JSON.parse(raw);
+          safeJsonString = JSON.stringify(parsed).replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+        } catch (e) {
+          // not valid JSON, escape raw
+          safeJsonString = JSON.stringify(String(raw)).replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+        }
+        const idx = Number(f.replace(/\D+/g,"")) || 0;
+        fs.appendFileSync(masterJsonPath, `${idx},${safeJsonString}\n`);
+      } catch (e) {
+        console.warn("master_json: skipping file", f, e?.message || e);
+      }
+    }
+
+    // ---------- 2) MASTER CSV (concatenate per-row CSVs) ----------
+    const csvFiles = (grouped["csv"] || []).sort((a,b) => {
+      return Number(a.replace(/\D+/g,"")) - Number(b.replace(/\D+/g,""));
+    });
+
+    if (csvFiles.length > 0) {
+      const masterCsvPath = path.join(jobDir, "master_csv.csv");
+      let headerWritten = false;
+      for (const f of csvFiles) {
+        try {
+          const full = path.join(rowsDir, f);
+          const content = fs.readFileSync(full, "utf8");
+          // split into lines
+          const lines = content.split(/\r?\n/).filter((l) => l.length > 0);
+          if (lines.length === 0) continue;
+          const header = lines[0];
+          const dataLines = lines.slice(1);
+
+          if (!headerWritten) {
+            fs.writeFileSync(masterCsvPath, header + "\n");
+            headerWritten = true;
+          } else {
+            // optionally check header mismatch and still append
+            // (we don't strictly enforce identical headers)
+          }
+
+          // append data lines
+          if (dataLines.length) {
+            fs.appendFileSync(masterCsvPath, dataLines.join("\n") + "\n");
+          }
+        } catch (e) {
+          console.warn("master_csv: skipping file", f, e?.message || e);
+        }
+      }
+    }
+
+    // ---------- 3) OTHER TYPES -> create zip per extension (html, png/jpg, txt, etc) ----------
+    const otherExts = Object.keys(grouped).filter(e => !["json","csv"].includes(e) && grouped[e].length > 0);
+
+    for (const ext of otherExts) {
+      try {
+        const files = grouped[ext];
+        if (!files || files.length === 0) continue;
+        // create sensible zip name
+        const zipName = `master_${ext}.zip`;
+        const zipPath = path.join(jobDir, zipName);
+        // Try to create zip (if archiver present)
+        if (archiver) {
+          await makeZip(zipPath, files, rowsDir).catch(err => {
+            console.warn("zip creation failed for", ext, err?.message || err);
+          });
+        } else {
+          // if archiver not available, copy first file as placeholder so frontend sees something
+          // (we won't overwrite existing placeholder)
+          if (!fs.existsSync(path.join(jobDir, `master_${ext}.placeholder`))) {
+            try {
+              fs.writeFileSync(path.join(jobDir, `master_${ext}.placeholder`), `archiver missing, files: ${files.join(",")}`);
+            } catch(e){}
+          }
+        }
+      } catch (e) {
+        console.warn("creating zip for ext failed:", ext, e?.message || e);
+      }
+    }
+
+    // Additionally, create a catch-all zip of all non-json/csv files (if archiver available)
+    const nonJsonCsvFiles = [];
+    for (const ext of otherExts) nonJsonCsvFiles.push(...grouped[ext]);
+    if (nonJsonCsvFiles.length > 0 && archiver) {
+      try {
+        const allZip = path.join(jobDir, "master_files.zip");
+        await makeZip(allZip, nonJsonCsvFiles, rowsDir).catch(()=>{});
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    // Update DB record: point to jobDir location (master_json exists at least)
+    const resultPath = masterJsonPath;
+    await job.update({ resultPath, status: "completed", finishedAt: new Date() }).catch(()=>{});
+
+    console.log(`✅ Master outputs created for job ${jobId} in ${jobDir}`);
+  } catch (e) {
+    console.warn("compileMasterResultsIfComplete error:", e?.message || e);
+  }
+}
 //
 //  🔥🔥🔥 REPLACED runRow() WITH PYTHON-RPC + PISCINA + FALLBACK TO SPAWN
 //

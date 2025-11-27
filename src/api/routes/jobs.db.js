@@ -242,7 +242,7 @@ router.get("/:id/rows/:rowIndex/files", requireAuth, async (req, res) => {
     return res.json({ files: [] });
   }
 
-  const prefix = `row_${rowIndex}.`;
+  const prefix = `row_${rowIndex}`;
 
   const files = fs.readdirSync(rowsDir)
     .filter(f => f.startsWith(prefix))
